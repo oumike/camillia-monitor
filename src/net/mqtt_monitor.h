@@ -33,6 +33,10 @@ struct MqttChannelStat {
     // has no per-message counts, so seeding from it and then adding messages
     // would produce a number that means neither thing.
     uint32_t topics;
+    // millis() when this channel was last active. Seeded rows get a synthetic
+    // stamp derived from the age the ingestor reported, so a channel last heard
+    // before the screen opened still shows its true recency.
+    uint32_t lastHeardMs;
     char     channel[MQTT_MON_CHANNEL_MAX];
 };
 
@@ -61,7 +65,7 @@ void     mqttCensusStart();
 // Seeds a channel with the topic count the ingestor already holds. Called for
 // each channel when the screen opens, before local observations are added, so
 // the screen shows the whole picture rather than only this session's share.
-void     mqttCensusSeed(const char *channel, uint32_t topics);
+void     mqttCensusSeed(const char *channel, uint32_t topics, uint32_t ageSeconds);
 
 // True once seeding has been attempted, whether or not it found anything — the
 // screen uses it to tell "nothing recorded" apart from "still loading".

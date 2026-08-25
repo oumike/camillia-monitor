@@ -56,6 +56,7 @@ lv_obj_t *mqttClockLabel = nullptr;
 lv_obj_t *mqttConnLabel = nullptr;
 lv_obj_t *mqttList = nullptr;
 lv_obj_t *mqttCountLabels[MQTT_MON_SLOTS] = {};
+lv_obj_t *mqttAccents[MQTT_MON_SLOTS] = {};
 uint32_t  mqttRenderedSeq = 0;
 int       mqttRenderedRows = -1;
 lv_obj_t *msgsHeardValue = nullptr;
@@ -74,9 +75,23 @@ constexpr uint32_t kStatusWarnColor = 0xF3B562;
 constexpr uint32_t kStatusOffColor  = 0x4A5A66;
 constexpr uint32_t kStatusBadColor  = 0xE87878;
 
-// Accent on the MQTT channel rows. The same blue the TOTAL NODES card uses, so
-// the two screens share a palette rather than inventing a second one.
-constexpr uint32_t kMqttAccentColor = 0x6CA9E8;
+// Recency bands for the MQTT channel accents. The stripe answers "is this
+// channel alive?", which a topic count on its own cannot — a channel with 40
+// topics that went quiet an hour ago looks identical to a busy one.
+constexpr uint32_t kMqttFreshMs  = 60UL * 1000UL;         // green
+constexpr uint32_t kMqttRecentMs = 15UL * 60UL * 1000UL;  // yellow
+constexpr uint32_t kMqttStaleMs  = 60UL * 60UL * 1000UL;  // red, then grey
+
+uint32_t mqttAccentFor(uint32_t lastHeardMs) {
+    // A zero stamp means the seed reported an age older than this device's
+    // uptime — heard, but long before we booted.
+    if (lastHeardMs == 0) return kStatusOffColor;
+    const uint32_t age = millis() - lastHeardMs;
+    if (age <= kMqttFreshMs)  return kStatusOkColor;
+    if (age <= kMqttRecentMs) return kStatusWarnColor;
+    if (age <= kMqttStaleMs)  return kStatusBadColor;
+    return kStatusOffColor;
+}
 
 // Defined below createStatusIcon; refreshMetrics drives it on the 1 s timer.
 void refreshStatusIcons();
@@ -281,6 +296,7 @@ void buildMqttList() {
     if (!mqttList) return;
     lv_obj_clean(mqttList);
     memset(mqttCountLabels, 0, sizeof(mqttCountLabels));
+    memset(mqttAccents, 0, sizeof(mqttAccents));
 
     const int rows = mqttChannelCount();
     mqttRenderedRows = rows;
@@ -331,7 +347,7 @@ void buildMqttList() {
         // child of a content-sized parent is circular.
         lv_obj_t *accent = lv_obj_create(row);
         lv_obj_set_size(accent, 3, 12);
-        lv_obj_set_style_bg_color(accent, lv_color_hex(kMqttAccentColor), 0);
+        lv_obj_set_style_bg_color(accent, lv_color_hex(mqttAccentFor(st->lastHeardMs)), 0);
         lv_obj_set_style_border_width(accent, 0, 0);
         lv_obj_set_style_radius(accent, 2, 0);
         lv_obj_remove_flag(accent, LV_OBJ_FLAG_SCROLLABLE);
@@ -354,6 +370,7 @@ void buildMqttList() {
         lv_label_set_long_mode(count, LV_LABEL_LONG_CLIP);
         lv_label_set_text(count, countText);
         mqttCountLabels[i] = count;
+        mqttAccents[i] = accent;
     }
 }
 
@@ -419,11 +436,62 @@ void refreshMqttOverlay() {
     for (int i = 0; i < rows && i < MQTT_MON_SLOTS; i++) {
         const MqttChannelStat *st = mqttChannelAt(i);
         if (!st || !mqttCountLabels[i]) continue;
+
         formatMqttCount(st->topics, countText, sizeof(countText));
         const char *shown = lv_label_get_text(mqttCountLabels[i]);
         if (!shown || strcmp(shown, countText) != 0) {
             lv_label_set_text(mqttCountLabels[i], countText);
         }
+        if (mqttAccents[i]) {
+            lv_obj_set_style_bg_color(mqttAccents[i],
+                                      lv_color_hex(mqttAccentFor(st->lastHeardMs)), 0);
+        }
+    }
+}
+
+// Bottom row: what the accent colours mean. Without it the stripes are
+// decoration — a colour nobody can decode is worse than no colour, because it
+// looks like it is saying something.
+void buildMqttLegend(lv_obj_t *parent) {
+    struct Band { uint32_t color; const char *label; };
+    static const Band kBands[] = {
+        { kStatusOkColor,   "<1m"   },
+        { kStatusWarnColor, "<15m"  },
+        { kStatusBadColor,  "<1h"   },
+        { kStatusOffColor,  "older" },
+    };
+
+    lv_obj_t *legend = lv_obj_create(parent);
+    lv_obj_set_size(legend, DISPLAY_WIDTH - 16, 14);
+    lv_obj_align(legend, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_remove_flag(legend, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(legend, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(legend, 0, 0);
+    lv_obj_set_style_pad_all(legend, 0, 0);
+    lv_obj_set_style_pad_column(legend, 4, 0);
+    lv_obj_set_flex_flow(legend, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(legend, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *lead = lv_label_create(legend);
+    lv_label_set_text(lead, "heard");
+    lv_obj_set_style_text_font(lead, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(lead, lv_color_hex(kMutedColor), 0);
+
+    for (const Band &b : kBands) {
+        // Same 3x12 stripe as the rows use, so the key is the thing itself
+        // rather than an approximation of it.
+        lv_obj_t *swatch = lv_obj_create(legend);
+        lv_obj_set_size(swatch, 3, 10);
+        lv_obj_set_style_bg_color(swatch, lv_color_hex(b.color), 0);
+        lv_obj_set_style_border_width(swatch, 0, 0);
+        lv_obj_set_style_radius(swatch, 2, 0);
+        lv_obj_remove_flag(swatch, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *text = lv_label_create(legend);
+        lv_label_set_text(text, b.label);
+        lv_obj_set_style_text_font(text, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(text, lv_color_hex(kMutedColor), 0);
     }
 }
 
@@ -495,7 +563,7 @@ void openMqttOverlay(lv_event_t *e) {
     lv_obj_align(mqttConnLabel, LV_ALIGN_TOP_RIGHT, 0, 22);
 
     mqttList = lv_obj_create(mqttOverlay);
-    lv_obj_set_size(mqttList, DISPLAY_WIDTH - 16, DISPLAY_HEIGHT - 56);
+    lv_obj_set_size(mqttList, DISPLAY_WIDTH - 16, DISPLAY_HEIGHT - 74);
     lv_obj_align(mqttList, LV_ALIGN_TOP_LEFT, 0, 40);
     lv_obj_set_style_bg_opa(mqttList, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(mqttList, 0, 0);
@@ -511,6 +579,7 @@ void openMqttOverlay(lv_event_t *e) {
     lv_obj_set_scrollbar_mode(mqttList, LV_SCROLLBAR_MODE_AUTO);
 
     buildMqttList();
+    buildMqttLegend(mqttOverlay);
     refreshMqttOverlay();
 }
 

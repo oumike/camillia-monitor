@@ -533,7 +533,9 @@ void fetchMqttSeed() {
         if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
             for (JsonObject c : doc["channels"].as<JsonArray>()) {
                 const char *name = c["channel"] | "";
-                if (name[0]) mqttCensusSeed(name, c["topics"] | 0U);
+                if (name[0]) {
+                    mqttCensusSeed(name, c["topics"] | 0U, c["lastSeenAgeSeconds"] | 0xFFFFFFFFUL);
+                }
             }
             if (!doc["count"].isNull()) {
                 sMqttChannels = doc["count"].as<uint32_t>();

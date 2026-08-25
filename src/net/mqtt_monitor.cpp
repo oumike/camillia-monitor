@@ -71,7 +71,6 @@ void topicKey(const char *topic, char *out, size_t outLen) {
 void record(const char *topic, bool isNewTopic) {
     if (!sActive || !topic || !topic[0]) return;
     bump(sTotal);
-    if (!isNewTopic) return;
 
     // Nothing is added to the channel table until the ingestor's figures have
     // been applied. Otherwise a channel heard in the second between the screen
@@ -94,9 +93,16 @@ void record(const char *topic, bool isNewTopic) {
     for (int i = 0; i < sCount; i++) {
         if (sHashes[i] != h) continue;
         if (strcmp(sTable[i].channel, key) != 0) continue;
-        bump(sTable[i].topics);
+        // Recency updates for every message; the topic count only for a new
+        // one. A channel repeating itself is still an active channel.
+        sTable[i].lastHeardMs = millis();
+        if (isNewTopic) bump(sTable[i].topics);
         return;
     }
+
+    // A channel not in the table yet, and nothing seeded it — only a genuinely
+    // new topic should create the row.
+    if (!isNewTopic) return;
 
     if (sCount >= MQTT_MON_SLOTS) {
         // Table full. New channels are counted in bulk rather than evicting a
@@ -108,6 +114,7 @@ void record(const char *topic, bool isNewTopic) {
 
     memcpy(sTable[sCount].channel, key, sizeof(key));
     sTable[sCount].topics = 1;
+    sTable[sCount].lastHeardMs = millis();
     sHashes[sCount] = h;
     sCount++;
     sSeq++;
@@ -278,7 +285,7 @@ void mqttCensusStart() {
     sStartedMs = millis();
 }
 
-void mqttCensusSeed(const char *channel, uint32_t topics) {
+void mqttCensusSeed(const char *channel, uint32_t topics, uint32_t ageSeconds) {
     if (!channel || !channel[0] || sCount >= MQTT_MON_SLOTS) return;
 
     const uint32_t h = fnv1a(channel);
@@ -296,6 +303,14 @@ void mqttCensusSeed(const char *channel, uint32_t topics) {
     strncpy(sTable[sCount].channel, channel, MQTT_MON_CHANNEL_MAX - 1);
     sTable[sCount].channel[MQTT_MON_CHANNEL_MAX - 1] = '\0';
     sTable[sCount].topics = topics;
+    // Project the reported age back onto this device's clock. Saturating at 0
+    // rather than wrapping: an age older than the device's uptime just means
+    // "long before we booted", which reads correctly as stale.
+    {
+        const uint32_t ageMs = (ageSeconds > 4000000UL) ? 0xFFFFFFFFUL : ageSeconds * 1000UL;
+        const uint32_t now = millis();
+        sTable[sCount].lastHeardMs = (ageMs >= now) ? 0 : (now - ageMs);
+    }
     sHashes[sCount] = h;
     sCount++;
     sSeq++;
