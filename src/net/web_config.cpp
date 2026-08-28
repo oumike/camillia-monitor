@@ -245,8 +245,8 @@ void sendStatus() {
 
     const UplinkStats u = uplinkStats();
     snprintf(buf, sizeof(buf),
-             "<tr><td>Nodes heard</td><td>%u known &middot; %u queued to send</td></tr>",
-             u.known, u.pending);
+             "<tr><td>Nodes heard</td><td>%u new to the store &middot; %u queued to send</td></tr>",
+             u.heard, u.pending);
     server.sendContent(buf);
 
     snprintf(buf, sizeof(buf),

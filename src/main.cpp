@@ -587,7 +587,10 @@ void refreshMetrics(lv_timer_t *timer) {
     LV_UNUSED(timer);
     const UplinkStats u = uplinkStats();
 
-    lv_label_set_text_fmt(heardValue, "%u", u.known);
+    // Nodes this device was the first to report, counted by the ingestor rather
+    // than here — see UplinkStats::heard. Not the number of distinct senders the
+    // radio has picked up, which is usually larger.
+    lv_label_set_text_fmt(heardValue, "%u", u.heard);
     // Distinct MQTT channels in the ingestor, not a local tally: the store
     // aggregates every monitor that has reported to it, so this figure is only
     // the server's to give. Dashes until the first fetch lands, for the same

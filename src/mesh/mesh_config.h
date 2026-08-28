@@ -32,10 +32,16 @@
 #define MAX_CHANNELS     MESH_CHANNELS
 
 // ── Observation limits ──────────────────────────────────────────────────────
-// A monitor sees far more nodes than a client does — it is deliberately
-// listening to everything, including traffic relayed from meshes it is not
-// part of. 250 slots at ~200 B each is ~50 KB, which PSRAM absorbs easily.
-#define MAX_NODES              250
+// How many distinct nodes this device will remember having reported. A monitor
+// sees far more nodes than a client does — it is deliberately listening to
+// everything, including traffic relayed from meshes it is not part of — so the
+// 250 a Meshtastic client keeps is the wrong ceiling here.
+//
+// Affordable because the roster holds identity and nothing else: 8 bytes per
+// node, so 4000 of them cost 32 KB — the same as the 250-entry table of full
+// node state this replaced. Everything a report says about a node is built
+// from the packet that prompted it and discarded once it has been sent.
+#define MAX_NODES              4000
 
 // Longest text payload retained from a decoded TEXT_MESSAGE_APP packet.
 #define MESH_TEXT_MAX_LEN      200

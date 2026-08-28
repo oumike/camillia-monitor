@@ -17,8 +17,13 @@
 // Derives this device's own node number and id (used as the `heardBy` field).
 void uplinkBegin();
 
-// Folds a received packet into what is known about its sender, and queues a
-// report when that is new or newly-enriched information.
+// Queues a report about the packet's sender when the packet is worth reporting:
+// the node is new, the packet decoded to something the node said about itself,
+// or the refresh interval has passed since it was last described.
+//
+// The report is built from this packet alone. Between reports the device keeps
+// only the node's number and when it was last reported — the ingestor merges by
+// omission, so nothing is lost by forgetting the detail once it has been sent.
 void uplinkNotePacket(const MeshPacket &pkt);
 
 // Drains at most one queued report per call. Safe to call when WiFi is down or
@@ -41,19 +46,28 @@ enum class UplinkState : uint8_t {
 UplinkState uplinkState();
 
 struct UplinkStats {
-    uint16_t known;    // distinct nodes observed since boot
+    // Nodes counted as heard since boot. The ingestor decides this, not us: a
+    // node is counted when the report announcing it is the one that brought it
+    // into the store. So this is what this device added to the mesh's picture,
+    // not how many distinct senders its radio saw — those differ whenever
+    // another monitor got there first.
+    uint16_t heard;
     uint16_t pending;  // reports waiting to be sent
     uint32_t sent;     // successful POSTs
     uint32_t failed;   // POSTs that did not return 2xx
-    uint16_t dropped;  // nodes never recorded because the table was full
 
-    // What the ingestor holds: the count fetched once at boot, plus every node
-    // this device has since created there. Counting locally rather than
-    // re-polling means the figure is only as good as our own reports — but the
-    // ingestor tells us which reports actually created a node, so a node we
-    // hear that was already stored does not inflate it.
+    // Node reports lost before they could be sent: evicted from a full queue,
+    // or — which should not happen at MAX_NODES — a node the roster had no room
+    // for. An eviction is not permanent: the node is still marked unreported,
+    // so its next packet queues it again.
+    uint16_t dropped;
+
+    // What the ingestor holds, as the ingestor last said it. Fetched once at
+    // boot and then replaced by the total every report comes back with, so the
+    // figure follows the store rather than approximating it — a locally
+    // maintained total would go stale the moment a second monitor stored a node.
     uint32_t ingestorTotal;
-    bool     ingestorTotalKnown;   // false until the boot fetch succeeds
+    bool     ingestorTotalKnown;   // false until the first count arrives
 
     // Distinct LoRa packets the ingestor holds. "Distinct" matters: a mesh
     // rebroadcasts heavily, so counting receptions would report several times

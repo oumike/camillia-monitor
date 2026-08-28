@@ -26,25 +26,38 @@ constexpr uint32_t kPostGapMs = 250;
 
 constexpr uint32_t kHttpTimeoutMs = 4000;
 
-struct NodeObs {
-    uint32_t nodeNum;        // 0 marks a free slot
-    uint32_t lastReportMs;
+// What this device remembers about a node between reports: that it exists, and
+// when it was last described to the ingestor. Nothing else — no name, no
+// position, no signal history. Those are properties of a packet, not of the
+// roster, and the ingestor is where they belong once a report has carried them.
+//
+// Keeping it to two words is what lets the roster hold thousands of nodes
+// instead of a few hundred. A monitor is an observer: the thing it must not run
+// out of room for is *which* nodes it has heard.
+struct NodeSeen {
+    uint32_t nodeNum;       // 0 marks a free slot
+    uint32_t lastReportMs;  // 0 until a report about it has been accepted
+};
 
-    char     longName[41];
-    char     shortName[9];
-    bool     hasLongName;
-    bool     hasShortName;
+NodeSeen sRoster[MAX_NODES];
 
-    char     nodeId[16];   // the node's own User.id, when it has told us
-    bool     hasNodeId;
+// One report waiting to go out, built from the packet that prompted it. Lives
+// only until the POST succeeds, so this is the only place node detail is held —
+// and only for the handful of nodes queued at any moment, not for every node
+// ever heard.
+struct NodeReport {
+    bool     used;
+    bool     firstSighting;  // nothing about this node has been sent before
+    bool     carriesFacts;   // decoded something the node said about itself
+    uint32_t nodeNum;
+    uint32_t lastHeardMs;    // when the packet behind this report arrived
+
+    char     nodeId[16];   bool hasNodeId;
+    char     longName[41]; bool hasLongName;
+    char     shortName[9]; bool hasShortName;
 
     uint8_t  hwModel;  bool hasHwModel;
     uint8_t  role;     bool hasRole;
-
-    // millis() when the packet behind the pending report arrived, so the report
-    // can carry the reception time rather than the send time. Those differ by
-    // however long the node waited in the send queue.
-    uint32_t lastHeardMs;
 
     float    snr;
     int16_t  rssi;
@@ -59,13 +72,17 @@ struct NodeObs {
 
     uint8_t  battLevel; bool hasBatt;
     float    voltage;   bool hasVoltage;
-
-    bool     reported;   // has been accepted by the ingestor at least once
-    bool     pending;    // has unsent changes
 };
 
-NodeObs  sNodes[MAX_NODES];
-uint16_t sKnown   = 0;
+// Deep enough to absorb the burst of discoveries a cold start produces while
+// the drain trickles them out at one per kPostGapMs. It holds at most one entry
+// per node — a second report for a node already queued replaces it rather than
+// taking another slot — so this is 32 *nodes* in flight, not 32 packets.
+constexpr uint8_t kNodeQueue = 32;
+
+NodeReport sNodeQueue[kNodeQueue];
+uint8_t    sNodeHead = 0;
+
 uint16_t sDropped = 0;
 uint32_t sSent    = 0;
 uint32_t sFailed  = 0;
@@ -74,18 +91,21 @@ uint32_t sOurNodeNum = 0;
 char     sOurNodeId[12] = "";
 
 uint32_t sLastPostMs = 0;
-uint16_t sScanCursor = 0;
 
 // Outcome of the most recent attempt, which is what the status icon reflects.
 bool sHasAttempted = false;
 bool sLastPostOk   = false;
 
-// Node count held by the ingestor when this device booted, and how many nodes
-// our reports have added to it since.
-uint32_t sIngestorBaseline    = 0;
-bool     sBaselineFetched     = false;
+// The ingestor's node total as it last reported it: fetched at boot, then
+// replaced by the figure every accepted report carries back. Never derived
+// here — other monitors add nodes too, and this device cannot see those.
+uint32_t sIngestorTotal       = 0;
+bool     sIngestorTotalKnown  = false;
 uint32_t sBaselineNextTryMs   = 0;
-uint32_t sCreatedSinceBoot    = 0;
+
+// Nodes counted as heard: one per report the ingestor answered with
+// created:true. See UplinkStats::heard for why the ingestor is the one counting.
+uint32_t sNodesHeard          = 0;
 
 // ── Messages ────────────────────────────────────────────────────────────────
 // A packet is identified by sender plus packet id; the id alone is only unique
@@ -152,47 +172,43 @@ bool seenBefore(uint32_t from, uint32_t packetId) {
     return false;
 }
 
-NodeObs *find(uint32_t nodeNum) {
+NodeSeen *rosterFind(uint32_t nodeNum) {
     for (uint16_t i = 0; i < MAX_NODES; i++) {
-        if (sNodes[i].nodeNum == nodeNum) return &sNodes[i];
+        if (sRoster[i].nodeNum == nodeNum) return &sRoster[i];
     }
     return nullptr;
 }
 
-NodeObs *findOrCreate(uint32_t nodeNum, bool &created) {
-    created = false;
-    if (NodeObs *n = find(nodeNum)) return n;
-
+// Linear over 4000 slots, run once per received packet. At mesh packet rates
+// that is nothing, and it keeps the roster a plain array — no buckets to size,
+// no rehashing, and a full scan is still only 16 KB of sequential reads.
+NodeSeen *rosterAdd(uint32_t nodeNum) {
     for (uint16_t i = 0; i < MAX_NODES; i++) {
-        if (sNodes[i].nodeNum != 0) continue;
-        NodeObs &n = sNodes[i];
-        n = NodeObs{};
-        n.nodeNum = nodeNum;
-        sKnown++;
-        created = true;
-        return &n;
+        if (sRoster[i].nodeNum != 0) continue;
+        sRoster[i] = NodeSeen{nodeNum, 0};
+        return &sRoster[i];
     }
 
-    // Table full. Deliberately not evicting the oldest: this device is meant to
-    // be watching a mesh that fits, and silently rotating nodes out would make
-    // the reports oscillate as evicted nodes get "discovered" again. Counted
-    // instead, so a full table is visible rather than inferred.
+    // Deliberately not evicting the oldest: a monitor is meant to be watching a
+    // mesh that fits, and rotating nodes out would make them get "discovered"
+    // again on their next packet. Counted instead, so a full roster is visible
+    // rather than inferred — though at MAX_NODES this should never happen.
     sDropped++;
     return nullptr;
 }
 
-// Copies src into dst when it differs, reporting whether anything changed.
-bool setStr(char *dst, size_t cap, const char *src, bool &has) {
-    if (!src || !src[0]) return false;
-    if (has && strncmp(dst, src, cap - 1) == 0) return false;
+// Copies a decoded string into a report, marking the field present. Non-empty
+// only: an absent name and an empty one mean the same thing on the wire, and
+// the ingestor merges by omission — sending "" would erase what it holds.
+void setStr(char *dst, size_t cap, const char *src, bool &has) {
+    if (!src || !src[0]) return;
     strncpy(dst, src, cap - 1);
     dst[cap - 1] = '\0';
     has = true;
-    return true;
 }
 
 // ── Report body ─────────────────────────────────────────────────────────────
-void buildReport(const NodeObs &n, String &out) {
+void buildReport(const NodeReport &n, String &out) {
     JsonDocument doc;
 
     doc["nodeNum"] = n.nodeNum;
@@ -266,7 +282,7 @@ bool buildApiUrl(const char *suffix, char *out, size_t cap) {
     return true;
 }
 
-bool postReport(const NodeObs &n) {
+bool postReport(const NodeReport &n) {
     String body;
     buildReport(n, body);
 
@@ -290,12 +306,18 @@ bool postReport(const NodeObs &n) {
     const bool ok = (status >= 200 && status < 300);
 
     if (ok) {
-        // The response says whether this report brought the node into
-        // existence. Without it the running total would drift: a node heard for
-        // the first time *here* is very often already stored there.
+        // Both counters come out of the response. `created` says this report is
+        // what brought the node into existence, which is what makes it worth
+        // counting as heard — a node heard for the first time *here* is very
+        // often already stored there. `totalNodes` is the store's own total,
+        // taken as given rather than added up locally.
         JsonDocument doc;
         if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-            if (doc["created"].as<bool>()) sCreatedSinceBoot++;
+            if (doc["created"].as<bool>()) sNodesHeard++;
+            if (doc["totalNodes"].is<uint32_t>()) {
+                sIngestorTotal      = doc["totalNodes"].as<uint32_t>();
+                sIngestorTotalKnown = true;
+            }
         }
     }
 
@@ -314,15 +336,13 @@ bool postReport(const NodeObs &n) {
     return ok;
 }
 
-// The portal configures the report URL (".../nodes/heard"); the count lives
-// next to it at ".../nodes/count". Deriving it keeps a second URL out of the
-// config form, at the cost of assuming the two stay siblings — if the report
-// URL is not a "/heard" route we simply never fetch a baseline, and the display
-// falls back to counting only what this device contributed.
+// Seeds the total at boot, before any node has been heard, so the screen shows
+// the store's figure from the first frame rather than dashes until something
+// transmits. Every report after this carries the total back, so this runs once.
 void fetchBaseline() {
     char url[192];
     if (!buildApiUrl("/nodes/count", url, sizeof(url))) {
-        sBaselineFetched = true;
+        sIngestorTotalKnown = true;
         return;
     }
 
@@ -336,10 +356,10 @@ void fetchBaseline() {
     if (status == 200) {
         JsonDocument doc;
         if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-            sIngestorBaseline = doc["count"] | 0U;
-            sBaselineFetched  = true;
+            sIngestorTotal      = doc["count"] | 0U;
+            sIngestorTotalKnown = true;
             Serial.printf("[uplink] ingestor holds %lu nodes at boot\n",
-                          (unsigned long)sIngestorBaseline);
+                          (unsigned long)sIngestorTotal);
         }
     } else {
         Serial.printf("[uplink] count fetch -> HTTP %d (will retry)\n", status);
@@ -624,87 +644,96 @@ void queueMessage(const MeshPacket &pkt) {
     }
 }
 
+// Queues a report, or folds it into the one already waiting for this node.
+//
+// At most one entry per node is in flight. A node that transmits three times
+// while the queue drains should cost one POST carrying its latest state, not
+// three carrying successively staler ones — and the newer report is a superset
+// whenever it decoded at least as much, since the header observations it
+// always carries are the fresher ones.
+void queueNodeReport(const NodeReport &r) {
+    for (uint8_t i = 0; i < kNodeQueue; i++) {
+        NodeReport &q = sNodeQueue[i];
+        if (!q.used || q.nodeNum != r.nodeNum) continue;
+        // A bare reception must not displace a queued NodeInfo that has not
+        // gone out yet — that would throw away the names it was carrying.
+        if (r.carriesFacts || !q.carriesFacts) {
+            const bool first = q.firstSighting;
+            q = r;
+            q.firstSighting = first;
+        }
+        return;
+    }
+
+    NodeReport &slot = sNodeQueue[sNodeHead];
+    // Overwrites the oldest unsent report when full, and counts it. Nothing is
+    // permanently lost: the evicted node's roster entry still says it has never
+    // been reported, so its next packet queues it again.
+    if (slot.used) sDropped++;
+    sNodeHead = (uint8_t)((sNodeHead + 1) % kNodeQueue);
+    slot = r;
+}
+
 void uplinkNotePacket(const MeshPacket &pkt) {
     const uint32_t from = pkt.hdr.from;
     if (from == 0 || from == kBroadcastNode) return;
 
     queueMessage(pkt);
 
-    bool created = false;
-    NodeObs *n = findOrCreate(from, created);
-    if (!n) return;
-
-    bool changed = created;
-    n->lastHeardMs = pkt.rxMs;
+    // Built fresh from this packet rather than accumulated across packets. The
+    // ingestor upserts by omission, so a report that mentions only what this
+    // packet carried cannot erase anything it learned from an earlier one —
+    // which is what makes it safe for the device to forget.
+    NodeReport r{};
+    r.used        = true;
+    r.nodeNum     = from;
+    r.lastHeardMs = pkt.rxMs;
 
     // ── Always-available observations, straight off the header ──────────────
-    const int16_t rssi = (int16_t)lroundf(pkt.rssi);
-    if (!n->hasSignal || n->rssi != rssi || fabsf(n->snr - pkt.snr) > 0.05f) {
-        n->snr = pkt.snr;
-        n->rssi = rssi;
-        n->hasSignal = true;
-        // Signal alone does not make a report urgent — it changes on every
-        // packet, and treating that as news would mean one POST per packet.
-        // It rides along with the next report instead.
-    }
+    r.snr       = pkt.snr;
+    r.rssi      = (int16_t)lroundf(pkt.rssi);
+    r.hasSignal = true;
 
     const uint8_t hopStart = (uint8_t)((pkt.hdr.flags >> 5) & 0x07);
     const uint8_t hopLimit = (uint8_t)(pkt.hdr.flags & 0x07);
     if (hopStart >= hopLimit) {
-        const uint8_t hops = (uint8_t)(hopStart - hopLimit);
-        if (!n->hasHops || n->hopsAway != hops) {
-            n->hasHops = true;
-            n->hopsAway = hops;
-            changed = true;   // a route change is worth reporting
-        }
+        r.hopsAway = (uint8_t)(hopStart - hopLimit);
+        r.hasHops  = true;
     }
-
-    const bool viaMqtt = (pkt.hdr.flags & 0x10) != 0;
-    if (n->viaMqtt != viaMqtt) { n->viaMqtt = viaMqtt; changed = true; }
+    r.viaMqtt = (pkt.hdr.flags & 0x10) != 0;
 
     // ── Decoded payloads ────────────────────────────────────────────────────
+    // Whether this packet said anything about the node itself. Header
+    // observations alone do not count: signal and hop count change on every
+    // packet, and treating them as news would mean one POST per packet.
+
     if (pkt.decrypted) {
         switch (pkt.portnum) {
             case NODEINFO_APP: {
                 UserInfo u{};
                 if (decodeUser(pkt.payload, pkt.payloadLen, u)) {
-                    // Every NODEINFO is reported, whether or not anything in it
-                    // differs from what we already hold. It is the one packet
-                    // that carries a node's own account of itself, it is sent
-                    // rarely, and a re-announcement is itself worth recording —
-                    // so this is not folded into the change detection below.
-                    changed = true;
-                    setStr(n->nodeId, sizeof(n->nodeId), u.id, n->hasNodeId);
-                    changed |= setStr(n->longName, sizeof(n->longName), u.longName,
-                                      n->hasLongName);
-                    changed |= setStr(n->shortName, sizeof(n->shortName), u.shortName,
-                                      n->hasShortName);
-                    if (u.hasHwModel && (!n->hasHwModel || n->hwModel != u.hwModel)) {
-                        n->hwModel = u.hwModel; n->hasHwModel = true; changed = true;
-                    }
-                    if (u.hasRole && (!n->hasRole || n->role != u.role)) {
-                        n->role = u.role; n->hasRole = true; changed = true;
-                    }
+                    // Every NodeInfo is reported, whether or not it differs from
+                    // what was sent before. It is the one packet carrying a
+                    // node's own account of itself, it is sent rarely, and a
+                    // re-announcement is itself worth recording.
+                    r.carriesFacts = true;
+                    setStr(r.nodeId, sizeof(r.nodeId), u.id, r.hasNodeId);
+                    setStr(r.longName, sizeof(r.longName), u.longName, r.hasLongName);
+                    setStr(r.shortName, sizeof(r.shortName), u.shortName, r.hasShortName);
+                    if (u.hasHwModel) { r.hwModel = u.hwModel; r.hasHwModel = true; }
+                    if (u.hasRole)    { r.role    = u.role;    r.hasRole    = true; }
                 }
                 break;
             }
             case POSITION_APP: {
                 PositionInfo p{};
                 if (decodePosition(pkt.payload, pkt.payloadLen, p) && p.hasLatLon) {
-                    if (!n->hasLatLon || n->latI != p.latI || n->lonI != p.lonI) {
-                        n->latI = p.latI; n->lonI = p.lonI;
-                        n->hasLatLon = true; changed = true;
-                    }
-                    if (p.alt != 0 || n->hasAlt) {
-                        if (!n->hasAlt || n->alt != p.alt) {
-                            n->alt = p.alt; n->hasAlt = true; changed = true;
-                        }
-                    }
+                    r.carriesFacts = true;
+                    r.latI = p.latI; r.lonI = p.lonI; r.hasLatLon = true;
+                    if (p.alt != 0)       { r.alt = p.alt; r.hasAlt = true; }
                     if (p.hasPrecisionBits) {
-                        if (!n->hasPrecision || n->precisionBits != p.precisionBits) {
-                            n->precisionBits = p.precisionBits;
-                            n->hasPrecision = true; changed = true;
-                        }
+                        r.precisionBits = p.precisionBits;
+                        r.hasPrecision  = true;
                     }
                 }
                 break;
@@ -712,17 +741,13 @@ void uplinkNotePacket(const MeshPacket &pkt) {
             case TELEMETRY_APP: {
                 TelemetryInfo t{};
                 if (decodeTelemetry(pkt.payload, pkt.payloadLen, t) && t.hasDeviceMetrics) {
+                    r.carriesFacts = true;
                     // battPct above 100 is meaningful here rather than a fault:
                     // Meshtastic uses it for a node running on external power,
                     // and the endpoint accepts up to 255 for that reason.
-                    const uint8_t pct = (uint8_t)constrain((int)lroundf(t.battPct), 0, 255);
-                    if (!n->hasBatt || n->battLevel != pct) {
-                        n->battLevel = pct; n->hasBatt = true; changed = true;
-                    }
-                    if (t.voltage > 0.0f &&
-                        (!n->hasVoltage || fabsf(n->voltage - t.voltage) > 0.01f)) {
-                        n->voltage = t.voltage; n->hasVoltage = true; changed = true;
-                    }
+                    r.battLevel = (uint8_t)constrain((int)lroundf(t.battPct), 0, 255);
+                    r.hasBatt   = true;
+                    if (t.voltage > 0.0f) { r.voltage = t.voltage; r.hasVoltage = true; }
                 }
                 break;
             }
@@ -731,14 +756,24 @@ void uplinkNotePacket(const MeshPacket &pkt) {
         }
     }
 
+    NodeSeen *seen = rosterFind(from);
+    if (!seen) {
+        seen = rosterAdd(from);
+        if (!seen) return;   // roster full — nothing to report against
+    }
+    r.firstSighting = (seen->lastReportMs == 0);
+
     // A node heard again with nothing new still gets re-reported periodically,
     // so the ingestor's "last heard" stays true for a node that is present but
     // quiet — a repeater relaying other people's traffic may never send a
     // packet of its own that decodes to anything.
-    const uint32_t sinceReport = millis() - n->lastReportMs;
-    if (n->reported && sinceReport >= gCfg.ingestIntervalS * 1000UL) changed = true;
+    const bool refreshDue =
+        seen->lastReportMs != 0 &&
+        (millis() - seen->lastReportMs) >= gCfg.ingestIntervalS * 1000UL;
 
-    if (changed) n->pending = true;
+    if (!r.carriesFacts && !r.firstSighting && !refreshDue) return;
+
+    queueNodeReport(r);
 }
 
 void uplinkLoop() {
@@ -762,10 +797,10 @@ void uplinkLoop() {
         return;
     }
 
-    if ((!sBaselineFetched || !sMessagesBaselineFetched || !sMqttChannelsKnown)
+    if ((!sIngestorTotalKnown || !sMessagesBaselineFetched || !sMqttChannelsKnown)
         && millis() >= sBaselineNextTryMs) {
         sBaselineNextTryMs = millis() + 10000;
-        if (!sBaselineFetched)         fetchBaseline();
+        if (!sIngestorTotalKnown)      fetchBaseline();
         if (!sMessagesBaselineFetched) fetchMessageBaseline();
         if (!sMqttChannelsKnown)       fetchMqttChannelBaseline();
     }
@@ -775,15 +810,15 @@ void uplinkLoop() {
     // Unreported nodes first: a newly discovered node is the thing this device
     // exists to surface, and it should not wait behind a queue of refreshes for
     // nodes the ingestor already knows about.
-    NodeObs *target = nullptr;
-    for (uint16_t i = 0; i < MAX_NODES && !target; i++) {
-        NodeObs &n = sNodes[i];
-        if (n.nodeNum != 0 && n.pending && !n.reported) target = &n;
+    NodeReport *target = nullptr;
+    for (uint8_t i = 0; i < kNodeQueue && !target; i++) {
+        NodeReport &r = sNodeQueue[(sNodeHead + i) % kNodeQueue];
+        if (r.used && r.firstSighting) target = &r;
     }
 
     // Then queued messages. Ahead of node refreshes because a message report is
-    // perishable — the ring overwrites it — while a node refresh only carries
-    // state that is still sitting in the table and will go out next time.
+    // perishable in a way a refresh is not: the next packet from the node
+    // rebuilds the refresh, while a message dropped from its ring is gone.
     if (!target) {
         for (uint8_t i = 0; i < kMsgQueue; i++) {
             // Oldest first: sMsgHead points at the next slot to fill, so that is
@@ -818,12 +853,11 @@ void uplinkLoop() {
         }
     }
 
-    // Then refreshes, round-robin from where the last scan stopped so one noisy
-    // node cannot starve the rest.
-    for (uint16_t step = 0; step < MAX_NODES && !target; step++) {
-        NodeObs &n = sNodes[sScanCursor];
-        sScanCursor = (uint16_t)((sScanCursor + 1) % MAX_NODES);
-        if (n.nodeNum != 0 && n.pending) target = &n;
+    // Then the rest of the ring, oldest first — refreshes, and reports for
+    // nodes the ingestor has already been told about.
+    for (uint8_t i = 0; i < kNodeQueue && !target; i++) {
+        NodeReport &r = sNodeQueue[(sNodeHead + i) % kNodeQueue];
+        if (r.used) target = &r;
     }
 
     if (!target) return;
@@ -832,21 +866,24 @@ void uplinkLoop() {
     sHasAttempted = true;
     if (postReport(*target)) {
         sLastPostOk = true;
-        const bool first = !target->reported;
-        target->pending = false;
-        target->reported = true;
-        target->lastReportMs = millis();
-        sSent++;
-        if (first) {
+        if (NodeSeen *seen = rosterFind(target->nodeNum)) {
+            // Any non-zero value marks the node as reported; it is also what the
+            // refresh interval counts from. millis() is only 0 for one tick at
+            // boot, but that tick would read as "never reported".
+            const uint32_t now = millis();
+            seen->lastReportMs = (now != 0) ? now : 1;
+        }
+        if (target->firstSighting) {
             Serial.printf("[uplink] new node %08lx%s%s\n",
                           (unsigned long)target->nodeNum,
                           target->hasLongName ? "  " : "",
                           target->hasLongName ? target->longName : "");
         }
+        *target = NodeReport{};   // the detail existed only to be sent
+        sSent++;
     } else {
-        // Left pending so it retries. Nothing is lost by a failed POST — the
-        // observation stays in the table and the next attempt carries whatever
-        // has been learned since.
+        // Left queued so it retries, and the roster still says the node has
+        // never been reported — so nothing is lost by a failed POST.
         sLastPostOk = false;
         sFailed++;
     }
@@ -865,20 +902,18 @@ const char *uplinkOurNodeId()  { return sOurNodeId; }
 
 UplinkStats uplinkStats() {
     UplinkStats s{};
-    s.known   = sKnown;
+    s.heard   = sNodesHeard;
     s.sent    = sSent;
     s.failed  = sFailed;
     s.dropped = sDropped;
-    s.ingestorTotalKnown = sBaselineFetched;
-    s.ingestorTotal      = sIngestorBaseline + sCreatedSinceBoot;
+    s.ingestorTotalKnown = sIngestorTotalKnown;
+    s.ingestorTotal      = sIngestorTotal;
     s.messagesTotalKnown = sMessagesBaselineFetched;
     s.messagesTotal      = sMessagesBaseline + sMessagesCreated;
     s.messagesDropped    = sMessagesDropped;
     s.mqttChannels       = sMqttChannels;
     s.mqttChannelsKnown  = sMqttChannelsKnown;
     for (uint8_t i = 0; i < kMsgQueue; i++) if (sMsgQueue[i].used) s.messagesQueued++;
-    for (uint16_t i = 0; i < MAX_NODES; i++) {
-        if (sNodes[i].nodeNum != 0 && sNodes[i].pending) s.pending++;
-    }
+    for (uint8_t i = 0; i < kNodeQueue; i++) if (sNodeQueue[i].used) s.pending++;
     return s;
 }
